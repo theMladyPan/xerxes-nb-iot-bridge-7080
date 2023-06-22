@@ -2,7 +2,7 @@
 #define __CONFIG_H__
 
 // define the board type
-#define isNBIOT false
+#define isNBIOT true
 
 // define preffered connection mode
 // 2 Auto // 13 GSM only // 38 LTE only

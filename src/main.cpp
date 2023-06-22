@@ -91,15 +91,13 @@ void disableAllPower()
     PMU.disableDC4();
     PMU.disableDC5();
     PMU.disableALDO1();
-
     PMU.disableALDO2();
     PMU.disableALDO3();
     PMU.disableALDO4();
-    PMU.disableBLDO2();
-    //Turn off gps power
-    PMU.disableBLDO2();      //The antenna power must be turned on to use the GPS function
     //Turn off the power supply for level conversion
     PMU.disableBLDO1();
+    //Turn off gps power
+    PMU.disableBLDO2();
     PMU.disableCPUSLDO();
     PMU.disableDLDO1();
     PMU.disableDLDO2();
@@ -116,7 +114,6 @@ void enableMinimalPower()
 {
     // Set the voltage of CPU back to to 3.3V
     PMU.setDC1Voltage(3300);
-    ESP_LOGI(TAG, "CPU freq: %d MHz, voltage: %d mV", getCpuFrequencyMhz(), PMU.getDC1Voltage());
 
     //Set the working voltage of the modem, please do not modify the parameters
     PMU.setDC3Voltage(3000);    //SIM7080 Modem main power channel 2700~ 3400V
@@ -164,24 +161,8 @@ uint32_t remainingCycleTimeUs(uint64_t sleep_for_us = TIME_TO_SLEEP * uS_TO_S_FA
  */
 void enterDeepSleep(uint64_t sleep_for_us = TIME_TO_SLEEP * uS_TO_S_FACTOR)
 {
-    ESP_LOGI(TAG, "Turning off modem");
-    // Turn off modem
+    modem.sleepEnable(false);
     modem.poweroff();
-
-    // Wait 10 seconds until the modem does not respond to the command, 
-    // and then proceed to the next step
-    for(int i = 0; i < 50; i++)
-    {
-        if(modem.testAT(100))
-        {
-            delay(100);
-        }
-        else
-        {
-            break;
-        }
-    }
-    ESP_LOGI(TAG, "Modem off. Disabling Power to the SIM module...");
 
     setCpuFrequencyMhz(10); // Set the CPU clock to 10MHz
     PMU.setDC1Voltage(3000); // lower CPU voltage to 3V
@@ -192,8 +173,7 @@ void enterDeepSleep(uint64_t sleep_for_us = TIME_TO_SLEEP * uS_TO_S_FACTOR)
 
     Serial1.end();
 
-    pinMode(BOARD_MODEM_PWR_PIN, INPUT);
-    pinMode(BOARD_MODEM_DTR_PIN, INPUT);
+    digitalWrite(BOARD_MODEM_PWR_PIN, HIGH);
 
     ESP_LOGI(TAG, "All systems off, entering deep sleep");
 
@@ -244,6 +224,15 @@ void enableDeadline()
 bool welcomeRequest();
 bool sendData(String &_jsonString);
 
+void modemRestart()
+{
+    // Pull down PWRKEY for more than 1 second according to manual requirements
+    digitalWrite(BOARD_MODEM_PWR_PIN, LOW);
+    delay(100);
+    digitalWrite(BOARD_MODEM_PWR_PIN, HIGH);
+    delay(1000);
+    digitalWrite(BOARD_MODEM_PWR_PIN, LOW);
+}
 
 void setup()
 {
@@ -275,38 +264,34 @@ void setup()
         }
     }
     enableMinimalPower();
+    pinMode(BOARD_MODEM_PWR_PIN, OUTPUT);
+    pinMode(BOARD_MODEM_DTR_PIN, OUTPUT);
+    pinMode(BOARD_MODEM_RI_PIN, INPUT);
+    modemRestart();
     delay(2000);
+
     ESP_LOGI(TAG, "Boot number: %d", bootCount);
-    
+    ESP_LOGI(TAG, "CPU freq: %d MHz, voltage: %d mV", getCpuFrequencyMhz(), PMU.getDC1Voltage());    
     ESP_LOGI(TAG, "Power chip initialized, modem enabled.");
 
     /*********************************
      * step 2 : start modem
     ***********************************/
-
     ESP_LOGI(TAG, "Starting modem...");
     Serial1.begin(115200, SERIAL_8N1, BOARD_MODEM_RXD_PIN, BOARD_MODEM_TXD_PIN);
 
-    pinMode(BOARD_MODEM_PWR_PIN, OUTPUT);
-    pinMode(BOARD_MODEM_DTR_PIN, OUTPUT);
-    pinMode(BOARD_MODEM_RI_PIN, INPUT);
 
     int retry = 0;
     while (!modem.testAT(1000)) {
         Serial.print(".");
         if (retry++ > 6) {
-            // Pull down PWRKEY for more than 1 second according to manual requirements
-            digitalWrite(BOARD_MODEM_PWR_PIN, LOW);
-            delay(100);
-            digitalWrite(BOARD_MODEM_PWR_PIN, HIGH);
-            delay(1000);
-            digitalWrite(BOARD_MODEM_PWR_PIN, LOW);
+            modemRestart();
             retry = 0;
             ESP_LOGW(TAG, "Retry start modem.");
         }
     }
     ESP_LOGI(TAG, "Modem start success!");
-
+    
 
     /*********************************
      * step 3 : Check if the SIM card is inserted
@@ -317,18 +302,18 @@ void setup()
     if (modem.getSimStatus() != SIM_READY) {
         ESP_LOGE(TAG, "SIM Card is not insert!!!");
         // restart esp
+        return;
     }
     ESP_LOGI(TAG, "SIM Card is ready!");
     
-    // Disable RF 0 = minimum functionality
+    // enable RF 1 = full functionality
     ESP_LOGI(TAG, "Enable RF");
     modem.sendAT("+CFUN=1");
     if (modem.waitResponse(20000UL) != 1) {
         ESP_LOGE(TAG, "Enable RF Failed!");
     }
     ESP_LOGI(TAG, "Enable RF Success!");
-    
-
+        
     /*********************************
      * step 4 : Set the network mode to NB-IOT
     ***********************************/
@@ -341,33 +326,18 @@ void setup()
 
     uint8_t mode = modem.getNetworkMode();
 
-    ESP_LOGI(TAG, "getNetworkMode:%u getPreferredMode:%u\n", mode, pre);
+    ESP_LOGI(TAG, "getNetworkMode:%u getPreferredMode:%u", mode, pre);
 
-
-    ESP_LOGI(TAG, "Set operators apn");
-    //Set the APN manually. Some operators need to set APN first when registering the network.
-    modem.sendAT("+CGDCONT=1,\"IP\",\"", __LTE_APN_NAME, "\"");
-    if (modem.waitResponse() != 1) {
-        ESP_LOGE(TAG, "Set operators apn Failed!");
-        return;
+    PMU.setChargingLedMode(XPOWERS_CHG_LED_BLINK_1HZ);
+    // GPRS connection parameters are usually set after network registration
+    ESP_LOGI(TAG, "Connecting to: %s as %s", __LTE_APN_NAME, __LTE_APN_USER);
+    while (!modem.gprsConnect(__LTE_APN_NAME, __LTE_APN_USER, __LTE_APN_PASS)) 
+    {
+        ESP_LOGW(TAG, "Not connected. Retrying in 2 seconds...");
+        delay(2000);
     }
-    ESP_LOGI(TAG, "Set operators apn success");
-
-    //!! Set the APN manually. Some operators need to set APN first when registering the network.
-    modem.sendAT("+CNCFG=0,1,\"", __LTE_APN_NAME, "\"");
-    if (modem.waitResponse() != 1) {
-        ESP_LOGE(TAG, "Config apn Failed!");
-        return;
-    }
-    /*
-    // re-enable RF, 1 = full functionality
-    modem.sendAT("+CFUN=1");
-    if (modem.waitResponse(20000UL) != 1) {
-        ESP_LOGE(TAG, "Enable RF Failed!");
-    }
-    ESP_LOGI(TAG, "Enable RF Success!");
-    */
-
+    ESP_LOGI(TAG, "Connected!");
+    
     /*********************************
     * step 5 : Wait for the network registration to succeed
     ***********************************/
@@ -384,15 +354,6 @@ void setup()
     } while (s != REG_OK_HOME && s != REG_OK_ROAMING) ;
 
     ESP_LOGI(TAG, "Network register info:%s", register_info[s]);
-
-
-    // Activate network bearer, APN can not be configured by default,
-    // if the SIM card is locked, please configure the correct APN and user password, use the gprsConnect() method
-    modem.sendAT("+CNACT=0,1");
-    if (modem.waitResponse() != 1) {
-        ESP_LOGE(TAG, "Activate network bearer Failed!");
-        return;
-    }
 
 
     bool res = modem.isGprsConnected();
@@ -418,7 +379,7 @@ void setup()
 
     String gsmTime = modem.getGSMDateTime(DATE_FULL);
     ESP_LOGI(TAG, "GSM Time:%s", gsmTime.c_str());
-    meta["time"]["gsm"]["local"] = gsmTime;
+    payload["time"]["gsm"]["local"] = gsmTime;
 
     if (bootCount % 100 == 1)
     {
@@ -430,20 +391,19 @@ void setup()
         meta["modem"]["SignalQuality"] = csq;
     }
     meta["bootCount"] = bootCount;
-    meta["power"]["battery"]["V"] = PMU.getBattVoltage();
+    meta["power"]["battery"]["V"] = PMU.getBattVoltage()/1000.0;
     meta["power"]["battery"]["percent"] = PMU.getBatteryPercent();
 
 
     /*********************************
     * step 6 : Send HTTP request
     ***********************************/
-
-    // convert UTC time to time since epoch
     
-    http_client.connectionKeepAlive();  // Currently, this is needed for HTTPS
+    // http_client.connectionKeepAlive();  // Currently, this is needed for HTTPS
 
     serializeJson(data, jsonString);
     ESP_LOGI(TAG, "JSON: %s", jsonString.c_str());
+    
 }
 
 
