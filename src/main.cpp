@@ -201,8 +201,7 @@ void enterDeepSleep(uint64_t sleep_for_us = TIME_TO_SLEEP * uS_TO_S_FACTOR)
 
     // setCpuFrequencyMhz(10); //Set the CPU clock to 80MHz
     // PMU.setDC1Voltage(2500); //lower CPU voltage to 2.5V
-    // esp_deep_sleep_start();
-    esp_light_sleep_start();
+    esp_deep_sleep_start();
     Serial.println("This will never be printed");
 }
 
