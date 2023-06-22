@@ -183,11 +183,17 @@ void enterDeepSleep(uint64_t sleep_for_us = TIME_TO_SLEEP * uS_TO_S_FACTOR)
     }
     ESP_LOGI(TAG, "Modem off. Disabling Power to the SIM module...");
 
+    setCpuFrequencyMhz(10); // Set the CPU clock to 10MHz
+    PMU.setDC1Voltage(3000); // lower CPU voltage to 3V
+    ESP_LOGI(TAG, "CPU freq: %d MHz, voltage: %d mV", getCpuFrequencyMhz(), PMU.getDC1Voltage());
     disableAllPower();
 
     Wire.end();
 
     Serial1.end();
+
+    pinMode(BOARD_MODEM_PWR_PIN, INPUT);
+    pinMode(BOARD_MODEM_DTR_PIN, INPUT);
 
     ESP_LOGI(TAG, "All systems off, entering deep sleep");
 
@@ -199,8 +205,6 @@ void enterDeepSleep(uint64_t sleep_for_us = TIME_TO_SLEEP * uS_TO_S_FACTOR)
     esp_sleep_enable_timer_wakeup(sleep_for_us - currentCycleTimeUs());
     // enter deep sleep 
 
-    // setCpuFrequencyMhz(10); //Set the CPU clock to 80MHz
-    // PMU.setDC1Voltage(2500); //lower CPU voltage to 2.5V
     esp_deep_sleep_start();
     Serial.println("This will never be printed");
 }
@@ -258,8 +262,6 @@ void setup()
     String strValue(__UUID);  // Convert const char[] to String
     data["colname"] = strValue.substring(0, 8);
 
-    delay(2000);
-    ESP_LOGI(TAG, "Boot number: %d", bootCount);
 
     /*********************************
      *  step 1 : Initialize power chip,
@@ -272,9 +274,11 @@ void setup()
             delay(5000);
         }
     }
-    
-    ESP_LOGI(TAG, "Power chip initialized, enabling modem power channel...");
     enableMinimalPower();
+    delay(2000);
+    ESP_LOGI(TAG, "Boot number: %d", bootCount);
+    
+    ESP_LOGI(TAG, "Power chip initialized, modem enabled.");
 
     /*********************************
      * step 2 : start modem
@@ -315,14 +319,15 @@ void setup()
         // restart esp
     }
     ESP_LOGI(TAG, "SIM Card is ready!");
-
+    
     // Disable RF 0 = minimum functionality
-    ESP_LOGI(TAG, "Disable RF");
-    modem.sendAT("+CFUN=0");
+    ESP_LOGI(TAG, "Enable RF");
+    modem.sendAT("+CFUN=1");
     if (modem.waitResponse(20000UL) != 1) {
-        ESP_LOGE(TAG, "Disable RF Failed!");
+        ESP_LOGE(TAG, "Enable RF Failed!");
     }
-    ESP_LOGI(TAG, "Disable RF Success!");
+    ESP_LOGI(TAG, "Enable RF Success!");
+    
 
     /*********************************
      * step 4 : Set the network mode to NB-IOT
@@ -354,13 +359,14 @@ void setup()
         ESP_LOGE(TAG, "Config apn Failed!");
         return;
     }
-
+    /*
     // re-enable RF, 1 = full functionality
     modem.sendAT("+CFUN=1");
     if (modem.waitResponse(20000UL) != 1) {
         ESP_LOGE(TAG, "Enable RF Failed!");
     }
     ESP_LOGI(TAG, "Enable RF Success!");
+    */
 
     /*********************************
     * step 5 : Wait for the network registration to succeed
@@ -388,10 +394,6 @@ void setup()
         return;
     }
 
-    // if (!modem.gprsConnect(apn, gprsUser, gprsPass)) {
-    //     return ;
-    // }
-
 
     bool res = modem.isGprsConnected();
     ESP_LOGI(TAG, "GPRS status:%s", res ? "connected" : "not connected");
@@ -416,8 +418,9 @@ void setup()
 
     String gsmTime = modem.getGSMDateTime(DATE_FULL);
     ESP_LOGI(TAG, "GSM Time:%s", gsmTime.c_str());
+    meta["time"]["gsm"]["local"] = gsmTime;
 
-    if (bootCount == 1)
+    if (bootCount % 100 == 1)
     {
         meta["modem"]["CCID"] = ccid;
         meta["modem"]["IMEI"] = imei;
@@ -425,7 +428,6 @@ void setup()
         meta["modem"]["Operator"] = cop;
         meta["modem"]["LocalIP"] = local.toString();
         meta["modem"]["SignalQuality"] = csq;
-        meta["modem"]["GSMTime"] = gsmTime;
     }
     meta["bootCount"] = bootCount;
     meta["power"]["battery"]["V"] = PMU.getBattVoltage();
