@@ -10,11 +10,5 @@
 #pragma once
 
 
-
-
 bool setupPower();
 void loopPower();
-
-
-
-

@@ -7,13 +7,19 @@
  *
  */
 #include <Arduino.h>
-#define XPOWERS_CHIP_AXP2101
 #include "XPowersLib.h"
 #include "utils.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_sleep.h"
 #include "power.h"
+#include "config.h"
+#include "HttpClient.h"
+#include "ArduinoJson.h"
+
+
+#define TINY_GSM_MODEM_SIM7080
+#include <TinyGsmClient.h>
 
 XPowersPMU  PMU;
 
@@ -22,8 +28,7 @@ XPowersPMU  PMU;
 
 #define TINY_GSM_RX_BUFFER 1024
 
-#define TINY_GSM_MODEM_SIM7080
-#include <TinyGsmClient.h>
+#undef USE_GPS // do not use GPS for now
 
 // Set serial for debug console (to the Serial Monitor, default speed 115200)
 #define SerialMon Serial
@@ -38,6 +43,16 @@ TinyGsm        modem(debugger);
 TinyGsm        modem(SerialAT);
 #endif
 
+TinyGsmClient client(modem, 0);
+
+HttpClient http_client = HttpClient(client, server, port);
+DynamicJsonDocument data(1024*4);
+auto payload = data["payload"];
+auto meta = payload["meta"];
+auto power = meta["power"];
+
+String jsonString;
+
 const char *register_info[] = {
     "Not registered, MT is not currently searching an operator to register to.The GPRS service is disabled, the UE is allowed to attach for GPRS if requested by the user.",
     "Registered, home network.",
@@ -47,82 +62,226 @@ const char *register_info[] = {
     "Registered, roaming.",
 };
 
-
 enum {
     MODEM_CATM = 1,
     MODEM_NB_IOT,
     MODEM_CATM_NBIOT,
 };
 
-void getPsmTimer();
+static int64_t cycleStart = 0;
 
-static const char* TAG = "MyModule";
+// RTC_DATA_ATTR is used to store data in RTC memory, so it will be retained
+// after deep sleep, start with -1 so first boot will be 0
+RTC_DATA_ATTR int bootCount = 0;  
 
-// const char apn[] = "ibasis.iot";
-const char gprsUser[] = "";
-const char gprsPass[] = "";
-bool  level = false;
-
-// Server details to test TCP/SSL
-const char server[]   = "vsh.pp.ua";
-const char resource[] = "/TinyGSM/logo.txt";
-
-//!! Set the APN manually. Some operators need to set APN first when registering the network.
-//!! Set the APN manually. Some operators need to set APN first when registering the network.
-//!! Set the APN manually. Some operators need to set APN first when registering the network.
-// Using 7080G with Hologram.io , https://github.com/Xinyuan-LilyGO/LilyGo-T-SIM7080G/issues/19
-// const char *apn = "hologram";
-
-const char *apn = "Your APN";
+static const char* TAG = "Main";
 
 
-void getWakeupReason();
+/**
+ * @brief disable all power domains except for DC1 - CPU
+ * 
+ */
+void disableAllPower()
+{
+
+    // Turn off other unused power domains
+    PMU.disableDC2();
+    //Turn off modem power
+    PMU.disableDC3();
+    PMU.disableDC4();
+    PMU.disableDC5();
+    PMU.disableALDO1();
+
+    PMU.disableALDO2();
+    PMU.disableALDO3();
+    PMU.disableALDO4();
+    PMU.disableBLDO2();
+    //Turn off gps power
+    PMU.disableBLDO2();      //The antenna power must be turned on to use the GPS function
+    //Turn off the power supply for level conversion
+    PMU.disableBLDO1();
+    PMU.disableCPUSLDO();
+    PMU.disableDLDO1();
+    PMU.disableDLDO2();
+
+    //Turn off chg led
+    PMU.setChargingLedMode(XPOWERS_CHG_LED_OFF);
+}
+
+
+/**
+ * @brief Enable minimal power domains for modem and level converter * 
+ */
+void enableMinimalPower()
+{
+    // Set the voltage of CPU back to to 3.3V
+    PMU.setDC1Voltage(3300);
+    ESP_LOGI(TAG, "CPU freq: %d MHz, voltage: %d mV", getCpuFrequencyMhz(), PMU.getDC1Voltage());
+
+    //Set the working voltage of the modem, please do not modify the parameters
+    PMU.setDC3Voltage(3000);    //SIM7080 Modem main power channel 2700~ 3400V
+    PMU.enableDC3();
+
+    //Set the working voltage of the level conversion
+    PMU.setBLDO1Voltage(3300);  //SIM7080 Modem level conversion power channel 2700~3400V
+    PMU.enableBLDO1();
+
+    #ifdef USE_GPS
+    ESP_LOGI(TAG, "Enabling GPS antenna power channel...");
+    //Modem GPS Power channel
+    PMU.setBLDO2Voltage(3300);
+    PMU.enableBLDO2();      //The antenna power must be turned on to use the GPS function
+    #endif // USE_GPS
+
+    // TS Pin detection must be disable, otherwise it cannot be charged
+    PMU.disableTSPinMeasure();
+    PMU.setChargingLedMode(XPOWERS_CHG_LED_ON);
+}
+
+
+/**
+ * @brief Get the current cycle time in us
+ * 
+ * @return uint32_t 
+ */
+uint32_t currentCycleTimeUs()
+{
+    return esp_timer_get_time() - cycleStart;    
+}
+
+
+uint32_t remainingCycleTimeUs(uint64_t sleep_for_us = TIME_TO_SLEEP * uS_TO_S_FACTOR)
+{
+    return sleep_for_us - currentCycleTimeUs();
+}
+
+
+/**
+ * @brief Enter deep sleep for a given time
+ * 
+ * @param sleep_for_us - time to sleep in us
+ * @param modem_off - true if modem should be turned off as well
+ */
+void enterDeepSleep(uint64_t sleep_for_us = TIME_TO_SLEEP * uS_TO_S_FACTOR)
+{
+    ESP_LOGI(TAG, "Turning off modem");
+    // Turn off modem
+    modem.poweroff();
+
+    // Wait 10 seconds until the modem does not respond to the command, 
+    // and then proceed to the next step
+    for(int i = 0; i < 50; i++)
+    {
+        if(modem.testAT(100))
+        {
+            delay(100);
+        }
+        else
+        {
+            break;
+        }
+    }
+    ESP_LOGI(TAG, "Modem off. Disabling Power to the SIM module...");
+
+    disableAllPower();
+
+    Wire.end();
+
+    Serial1.end();
+
+    ESP_LOGI(TAG, "All systems off, entering deep sleep");
+
+    auto cycleDuration = currentCycleTimeUs();
+    ESP_LOGI(TAG, "Cycle duration: %.1fs, sleeping for: %.1fs", (float)(cycleDuration / 1e6), (float)((sleep_for_us-cycleDuration) / 1e6));
+    Serial.flush();
+
+    // setup wake up timer to wake up after rest of the cycle duration
+    esp_sleep_enable_timer_wakeup(sleep_for_us - currentCycleTimeUs());
+    // enter deep sleep 
+
+    // setCpuFrequencyMhz(10); //Set the CPU clock to 80MHz
+    // PMU.setDC1Voltage(2500); //lower CPU voltage to 2.5V
+    // esp_deep_sleep_start();
+    esp_light_sleep_start();
+    Serial.println("This will never be printed");
+}
+
+
+/**
+ * @brief Callback function for the one-shot timer
+ * 
+ * @param arg - not used
+ */
+static void oneshot_timer_callback(void* arg)
+{
+    ESP_LOGI(TAG, "Deadline reached, entering deep sleep");
+    enterDeepSleep();
+}
+
+
+/// @brief Setup deep sleep timer to enter deep sleep in case of failure after MAX_CYCLE_TIME
+void enableDeadline()
+{
+    // Setup deep-sleep timer to enter deep sleep in 60 seconds - in case of failure
+    ESP_LOGD(TAG, "Setting up timer to enter deep sleep in %d seconds", MAX_CYCLE_TIME);
+    const esp_timer_create_args_t oneshot_timer_args = {
+        callback : &oneshot_timer_callback,
+        arg : NULL,
+        dispatch_method : ESP_TIMER_TASK,
+        /* argument specified here will be passed to timer callback function */
+        name : "one-shot"
+    };
+    esp_timer_handle_t oneshot_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&oneshot_timer_args, &oneshot_timer));
+    ESP_ERROR_CHECK(esp_timer_start_once(oneshot_timer, MAX_CYCLE_TIME * uS_TO_S_FACTOR));
+    ESP_LOGD(TAG, "Timer set up! Tik tok, tik tok...");
+}
+
+
+bool welcomeRequest();
+bool sendData(String &_jsonString);
+
 
 void setup()
 {
-
+    setCpuFrequencyMhz(80); //Set the CPU clock to 80MHz
+    cycleStart = esp_timer_get_time();
+    bool level = false;
     Serial.begin(115200);
+    // get the start time of the cycle in us since boot
+    bootCount++;
+    enableDeadline();
 
-    delay(3000);
-    ESP_LOGI(TAG, "setup begin");
+    data["dbname"] = __DB_NAME;
+    data["token"] = __API_TOKEN;
+    data["uuid"] = __UUID;
+    // define colname as first 8 bytes of __UUID
+    String strValue(__UUID);  // Convert const char[] to String
+    data["colname"] = strValue.substring(0, 8);
 
-    ESP_LOGI(TAG, "Setup power chip");
-
-    setupPower();
-
-    getWakeupReason();
-
-    // enter deep sleep mode for 10 seconds
-    ESP.deepSleep(10e6);
-
-    Serial.println();
+    delay(2000);
+    ESP_LOGI(TAG, "Boot number: %d", bootCount);
 
     /*********************************
      *  step 1 : Initialize power chip,
      *  turn on modem and gps antenna power channel
     ***********************************/
+    ESP_LOGI(TAG, "Initializing power chip...");
     if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
-        Serial.println("Failed to initialize power.....");
+        ESP_LOGE(TAG, "Failed to initialize power.....");
         while (1) {
             delay(5000);
         }
     }
-    //Set the working voltage of the modem, please do not modify the parameters
-    PMU.setDC3Voltage(3000);    //SIM7080 Modem main power channel 2700~ 3400V
-    PMU.enableDC3();
-
-    //Modem GPS Power channel
-    PMU.setBLDO2Voltage(3300);
-    PMU.enableBLDO2();      //The antenna power must be turned on to use the GPS function
-
-    // TS Pin detection must be disable, otherwise it cannot be charged
-    PMU.disableTSPinMeasure();
-
+    
+    ESP_LOGI(TAG, "Power chip initialized, enabling modem power channel...");
+    enableMinimalPower();
 
     /*********************************
      * step 2 : start modem
     ***********************************/
 
+    ESP_LOGI(TAG, "Starting modem...");
     Serial1.begin(115200, SERIAL_8N1, BOARD_MODEM_RXD_PIN, BOARD_MODEM_TXD_PIN);
 
     pinMode(BOARD_MODEM_PWR_PIN, OUTPUT);
@@ -140,11 +299,10 @@ void setup()
             delay(1000);
             digitalWrite(BOARD_MODEM_PWR_PIN, LOW);
             retry = 0;
-            Serial.println("Retry start modem .");
+            ESP_LOGW(TAG, "Retry start modem.");
         }
     }
-    Serial.println();
-    Serial.print("Modem started!");
+    ESP_LOGI(TAG, "Modem start success!");
 
 
     /*********************************
@@ -152,22 +310,25 @@ void setup()
     ***********************************/
     String result ;
 
-
+    ESP_LOGI(TAG, "Check SIM card status");
     if (modem.getSimStatus() != SIM_READY) {
-        Serial.println("SIM Card is not insert!!!");
-        return ;
+        ESP_LOGE(TAG, "SIM Card is not insert!!!");
+        // restart esp
     }
+    ESP_LOGI(TAG, "SIM Card is ready!");
 
-    // Disable RF
+    // Disable RF 0 = minimum functionality
+    ESP_LOGI(TAG, "Disable RF");
     modem.sendAT("+CFUN=0");
     if (modem.waitResponse(20000UL) != 1) {
-        Serial.println("Disable RF Failed!");
+        ESP_LOGE(TAG, "Disable RF Failed!");
     }
+    ESP_LOGI(TAG, "Disable RF Success!");
 
     /*********************************
      * step 4 : Set the network mode to NB-IOT
     ***********************************/
-
+    ESP_LOGI(TAG, "Set the network mode to NB-IOT");
     modem.setNetworkMode(2);    //use automatic
 
     modem.setPreferredMode(MODEM_NB_IOT);
@@ -176,28 +337,31 @@ void setup()
 
     uint8_t mode = modem.getNetworkMode();
 
-    Serial.printf("getNetworkMode:%u getPreferredMode:%u\n", mode, pre);
+    ESP_LOGI(TAG, "getNetworkMode:%u getPreferredMode:%u\n", mode, pre);
 
 
+    ESP_LOGI(TAG, "Set operators apn");
     //Set the APN manually. Some operators need to set APN first when registering the network.
-    modem.sendAT("+CGDCONT=1,\"IP\",\"", apn, "\"");
+    modem.sendAT("+CGDCONT=1,\"IP\",\"", __LTE_APN_NAME, "\"");
     if (modem.waitResponse() != 1) {
-        Serial.println("Set operators apn Failed!");
+        ESP_LOGE(TAG, "Set operators apn Failed!");
         return;
     }
+    ESP_LOGI(TAG, "Set operators apn success");
 
     //!! Set the APN manually. Some operators need to set APN first when registering the network.
-    modem.sendAT("+CNCFG=0,1,\"", apn, "\"");
+    modem.sendAT("+CNCFG=0,1,\"", __LTE_APN_NAME, "\"");
     if (modem.waitResponse() != 1) {
-        Serial.println("Config apn Failed!");
+        ESP_LOGE(TAG, "Config apn Failed!");
         return;
     }
 
-    // Enable RF
+    // re-enable RF, 1 = full functionality
     modem.sendAT("+CFUN=1");
     if (modem.waitResponse(20000UL) != 1) {
-        Serial.println("Enable RF Failed!");
+        ESP_LOGE(TAG, "Enable RF Failed!");
     }
+    ESP_LOGI(TAG, "Enable RF Success!");
 
     /*********************************
     * step 5 : Wait for the network registration to succeed
@@ -214,19 +378,14 @@ void setup()
 
     } while (s != REG_OK_HOME && s != REG_OK_ROAMING) ;
 
-    Serial.println();
-    Serial.print("Network register info:");
-    Serial.println(register_info[s]);
-
-
-
+    ESP_LOGI(TAG, "Network register info:%s", register_info[s]);
 
 
     // Activate network bearer, APN can not be configured by default,
     // if the SIM card is locked, please configure the correct APN and user password, use the gprsConnect() method
     modem.sendAT("+CNACT=0,1");
     if (modem.waitResponse() != 1) {
-        Serial.println("Activate network bearer Failed!");
+        ESP_LOGE(TAG, "Activate network bearer Failed!");
         return;
     }
 
@@ -234,192 +393,130 @@ void setup()
     //     return ;
     // }
 
+
     bool res = modem.isGprsConnected();
-    Serial.print("GPRS status:");
-    Serial.println(res ? "connected" : "not connected");
+    ESP_LOGI(TAG, "GPRS status:%s", res ? "connected" : "not connected");
 
     String ccid = modem.getSimCCID();
-    Serial.print("CCID:");
-    Serial.println(ccid);
+    ESP_LOGI(TAG, "CCID:%s", ccid.c_str());
 
     String imei = modem.getIMEI();
-    Serial.print("IMEI:");
-    Serial.println(imei);
+    ESP_LOGI(TAG, "IMEI:%s", imei.c_str());
 
     String imsi = modem.getIMSI();
-    Serial.print("IMSI:");
-    Serial.println(imsi);
+    ESP_LOGI(TAG, "IMSI:%s", imsi.c_str());
 
     String cop = modem.getOperator();
-    Serial.print("Operator:");
-    Serial.println(cop);
+    ESP_LOGI(TAG, "Operator:%s", cop.c_str());
 
     IPAddress local = modem.localIP();
-    Serial.print("Local IP:");
-    Serial.println(local);
+    ESP_LOGI(TAG, "Local IP:%s", local.toString().c_str());
 
     int csq = modem.getSignalQuality();
-    Serial.print("Signal quality:");
-    Serial.println(csq);
+    ESP_LOGI(TAG, "Signal quality:%d", csq);
+
+    String gsmTime = modem.getGSMDateTime(DATE_FULL);
+    ESP_LOGI(TAG, "GSM Time:%s", gsmTime.c_str());
+
+    if (bootCount == 1)
+    {
+        meta["modem"]["CCID"] = ccid;
+        meta["modem"]["IMEI"] = imei;
+        meta["modem"]["IMSI"] = imsi;
+        meta["modem"]["Operator"] = cop;
+        meta["modem"]["LocalIP"] = local.toString();
+        meta["modem"]["SignalQuality"] = csq;
+        meta["modem"]["GSMTime"] = gsmTime;
+    }
+    meta["bootCount"] = bootCount;
+    meta["power"]["battery"]["V"] = PMU.getBattVoltage();
+    meta["power"]["battery"]["percent"] = PMU.getBatteryPercent();
+
 
     /*********************************
     * step 6 : Send HTTP request
     ***********************************/
-    TinyGsmClient client(modem, 0);
-    const int     port = 80;
-    Serial.printf("Connecting to", server);
-    if (!client.connect(server, port)) {
-        Serial.println("... failed");
-    } else {
-        // Make a HTTP GET request:
-        client.print(String("GET ") + resource + " HTTP/1.0\r\n");
-        client.print(String("Host: ") + server + "\r\n");
-        client.print("Connection: close\r\n\r\n");
 
-        // Wait for data to arrive
-        uint32_t start = millis();
-        while (client.connected() && !client.available() &&
-                millis() - start < 30000L) {
-            delay(100);
-        };
+    // convert UTC time to time since epoch
+    
+    http_client.connectionKeepAlive();  // Currently, this is needed for HTTPS
 
-        // Read data
-        start          = millis();
-        char logo[640] = {
-            '\0',
-        };
-        int read_chars = 0;
-        while (client.connected() && millis() - start < 10000L) {
-            while (client.available()) {
-                logo[read_chars]     = client.read();
-                logo[read_chars + 1] = '\0';
-                read_chars++;
-                start = millis();
-            }
-        }
-        Serial.println(logo);
-        Serial.print("#####  RECEIVED:");
-        Serial.print(strlen(logo));
-        Serial.println("CHARACTERS");
-        client.stop();
-    }
-
-    /*********************************
-    * step 6 : Send HTTPS request
-    ***********************************/
-    TinyGsmClientSecure secureClient(modem, 1);
-    const int           securePort = 443;
-    Serial.printf("Connecting securely to", server);
-    if (!secureClient.connect(server, securePort)) {
-        Serial.println("... failed");
-    } else {
-        // Make a HTTP GET request:
-        secureClient.print(String("GET ") + resource + " HTTP/1.0\r\n");
-        secureClient.print(String("Host: ") + server + "\r\n");
-        secureClient.print("Connection: close\r\n\r\n");
-
-        // Wait for data to arrive
-        uint32_t startS = millis();
-        while (secureClient.connected() && !secureClient.available() &&
-                millis() - startS < 30000L) {
-            delay(100);
-        };
-
-        // Read data
-        startS          = millis();
-        char logoS[640] = {
-            '\0',
-        };
-        int read_charsS = 0;
-        while (secureClient.connected() && millis() - startS < 10000L) {
-            while (secureClient.available()) {
-                logoS[read_charsS]     = secureClient.read();
-                logoS[read_charsS + 1] = '\0';
-                read_charsS++;
-                startS = millis();
-            }
-        }
-        Serial.println(logoS);
-        Serial.print("#####  RECEIVED:");
-        Serial.print(strlen(logoS));
-        Serial.println("CHARACTERS");
-        secureClient.stop();
-    }
+    serializeJson(data, jsonString);
+    ESP_LOGI(TAG, "JSON: %s", jsonString.c_str());
 }
+
 
 void loop()
 {
-    while (Serial1.available()) {
-        Serial.write(Serial1.read());
+    // retry 3 times:
+    for(int i=0; i<3; i++)
+    {
+        if (sendData(jsonString))
+        {
+            break;
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Failed to send data, retrying...");
+        }
     }
-    while (Serial.available()) {
-        Serial1.write(Serial.read());
+
+    http_client.stop();
+
+    // blink PMU led thrice to indicate success
+    for(int i=0; i<3; i++)
+    {
+        PMU.setChargingLedMode(XPOWERS_CHG_LED_ON);
+        delay(100);
+        PMU.setChargingLedMode(XPOWERS_CHG_LED_OFF);
+        delay(100);
     }
+
+    enterDeepSleep();
 }
 
-
-void getWakeupReason()
+bool sendData(String &_jsonString)
 {
-    esp_sleep_wakeup_cause_t wakeup_reason;
+    ESP_LOGI(TAG, "Performing HTTPS POST request");
+ 
+    // send JSON
+    int err = http_client.post(String(API_URL_INSERT_ONE), "application/json", _jsonString);
+    ESP_LOGI(TAG, "POST request sent");
 
-    wakeup_reason = esp_sleep_get_wakeup_cause();
-
-    switch (wakeup_reason) {
-    case ESP_SLEEP_WAKEUP_UNDEFINED:
-        //!< In case of deep sleep, reset was not caused by exit from deep sleep
-        Serial.println("In case of deep sleep, reset was not caused by exit from deep sleep");
-        break;
-    case ESP_SLEEP_WAKEUP_ALL:
-        //!< Not a wakeup cause: used to disable all wakeup sources with esp_sleep_disable_wakeup_source
-        Serial.println("Not a wakeup cause: used to disable all wakeup sources with esp_sleep_disable_wakeup_source");
-        break;
-    case ESP_SLEEP_WAKEUP_EXT0:
-        //!< Wakeup caused by external signal using RTC_IO
-        Serial.println("Wakeup caused by external signal using RTC_IO");
-        break;
-    case ESP_SLEEP_WAKEUP_EXT1:
-        //!< Wakeup caused by external signal using RTC_CNTL
-        Serial.println("Wakeup caused by external signal using RTC_CNTL");
-        break;
-    case ESP_SLEEP_WAKEUP_TIMER:
-        //!< Wakeup caused by timer
-        Serial.println("Wakeup caused by timer");
-        break;
-    case ESP_SLEEP_WAKEUP_TOUCHPAD:
-        //!< Wakeup caused by touchpad
-        Serial.println("Wakeup caused by touchpad");
-        break;
-    case ESP_SLEEP_WAKEUP_ULP:
-        //!< Wakeup caused by ULP program
-        Serial.println("Wakeup caused by ULP program");
-        break;
-    case  ESP_SLEEP_WAKEUP_GPIO:
-        //!< Wakeup caused by GPIO (light sleep only)
-        Serial.println("Wakeup caused by GPIO (light sleep only)");
-        break;
-    case ESP_SLEEP_WAKEUP_UART:
-        //!< Wakeup caused by UART (light sleep only)
-        Serial.println("Wakeup caused by UART (light sleep only)");
-        break;
-    case ESP_SLEEP_WAKEUP_WIFI:
-        //!< Wakeup caused by WIFI (light sleep only)
-        Serial.println("Wakeup caused by WIFI (light sleep only)");
-        break;
-    case ESP_SLEEP_WAKEUP_COCPU:
-        //!< Wakeup caused by COCPU int
-        Serial.println("Wakeup caused by COCPU int");
-        break;
-    case ESP_SLEEP_WAKEUP_COCPU_TRAP_TRIG:
-        //!< Wakeup caused by COCPU crash
-        Serial.println("Wakeup caused by COCPU crash");
-        break;
-    case  ESP_SLEEP_WAKEUP_BT:
-        //!< Wakeup caused by BT (light sleep only)
-        Serial.println("Wakeup caused by BT (light sleep only)");
-        break;
-    default :
-        Serial.printf("Wakeup was not caused by deep sleep: %d\n", wakeup_reason);
-        break;
-
+    if (err != 0) {
+        ESP_LOGE(TAG, "HTTP POST request failed, errno: %d", err);
     }
+    else
+    {
+        ESP_LOGI(TAG, "HTTP POST request success");
+        int responseCode = http_client.responseStatusCode();
+        ESP_LOGI(TAG, "Response #: %d", responseCode);
+        ESP_LOGI(TAG, "Response body: %s", http_client.responseBody().c_str());
+        if (responseCode == 201)  // 201 = Created
+        {
+            return true;
+        }
+    }   
+    return false;
+}
+
+bool welcomeRequest()
+{
+    ESP_LOGI(TAG, "Performing HTTPS GET request");
+ 
+    // send JSON
+    int err = http_client.get(String(API_URL_WELCOME));
+    ESP_LOGI(TAG, "GET request sent");
+
+    if (err != 0) {
+        ESP_LOGE(TAG, "HTTP GET request failed, errno: %d", err);
+        return false;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "HTTP GET request success");
+        ESP_LOGI(TAG, "Response #: %d", http_client.responseStatusCode());
+        ESP_LOGI(TAG, "Response body: %s", http_client.responseBody().c_str());
+        return true;
+    }   
 }
