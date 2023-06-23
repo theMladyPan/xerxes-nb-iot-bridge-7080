@@ -18,9 +18,9 @@ const int rand_pin = 33;  // to sample noise from the ADC for the random number 
 // convenient constants
 constexpr unsigned long uS_TO_S_FACTOR = 1000000ULL;  // Conversion factor for micro seconds to seconds
 // 3 min = Time ESP32 will go to sleep (in seconds) must be higher than MAX_CYCLE_TIME
-constexpr int TIME_TO_SLEEP = 60; 
+constexpr int TIME_TO_SLEEP = 120; 
 // 1:40 min = max time to wait for a response from the server
-constexpr int MAX_CYCLE_TIME = 59; 
+constexpr int MAX_CYCLE_TIME = 90; 
 
 
 #endif // __CONFIG_H__
